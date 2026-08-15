@@ -9,6 +9,10 @@
 		"check:types": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json"
 	},
 	"dependencies": {
+		"@earendil-works/pi-ai": "^0.83.0",
+		"@flue/runtime": "workspace:*",
+		"@flue/sdk": "workspace:*",
+		"@flue/svelte": "workspace:*",
 		"@hono/node-server": "^2.0.3",
 		"hono": "4.12.32"
 	},
