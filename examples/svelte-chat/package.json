@@ -1,0 +1,25 @@
+{
+	"name": "svelte-chat-example",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"dev": "pnpm run build:ui && vite dev",
+		"build": "vite build && pnpm run build:ui",
+		"build:ui": "vite build --config vite.config.ui.ts",
+		"check:types": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json"
+	},
+	"dependencies": {
+		"@hono/node-server": "^2.0.3",
+		"hono": "4.12.32"
+	},
+	"devDependencies": {
+		"@flue/vite": "workspace:*",
+		"@sveltejs/adapter-static": "^3.0.10",
+		"@sveltejs/kit": "^2.63.0",
+		"@sveltejs/vite-plugin-svelte": "^7.1.2",
+		"svelte": "^5.56.1",
+		"svelte-check": "^4.6.0",
+		"typescript": "^6.0.3",
+		"vite": "^8.0.16"
+	}
+}
