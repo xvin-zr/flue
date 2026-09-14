@@ -1,0 +1,16 @@
+flue-svelte
+
+Community-maintained, unofficial adapter derived from the Flue workspace
+(https://github.com/withastro/flue), distributed under Apache-2.0.
+No upstream NOTICE file was present in the source checkout.
+Maintenance repository: https://github.com/xvin-zr/flue
+
+Community distribution changes:
+- package.json: renamed to flue-svelte, independently versioned, pointed
+  repository/homepage/bugs at https://github.com/xvin-zr/flue, pinned the
+  public SDK, and included license and attribution files.
+- README.md: updated community identity, installation, links and release guidance.
+The adapter implementation is unchanged. Build output is generated from it.
+
+The upstream project name is used only to identify the origin; this package
+is not an official Flue release and does not imply upstream endorsement.
