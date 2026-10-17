@@ -128,12 +128,18 @@ type DeliveredMessage =
 
 type DeliveredMessageInput = string | DeliveredMessage;
 
-type DeliveredAttachment = PromptImage & { filename?: string };
+type DeliveredAttachment = (PromptImage | PromptDocument) & { filename?: string };
+
+interface PromptDocument {
+  type: 'document';
+  data: string; // base64
+  mimeType: string; // 'application/pdf'
+}
 ```
 
 The single unified input shape for every delivery surface: `dispatch()`, the `init()` handle, [`useDispatchMessage()`](/docs/reference/agent-hooks-api/#usedispatchmessage), and a direct HTTP prompt (whose wire body is this shape verbatim). Everywhere a `DeliveredMessageInput` is accepted, a bare string is shorthand for `{ kind: 'user', body }`.
 
-- `kind: 'user'` — a direct user talking to the assistant. Produces a canonical `user_message` record and projects with `purpose: 'user'` in the conversation. `attachments` carries images for vision-capable models: `{ type: 'image', data, mimeType, filename? }`, where `data` is base64 and capped at 14 MiB of base64 characters per attachment (`14 * 1024 * 1024`). Images are the only supported attachment.
+- `kind: 'user'` — a direct user talking to the assistant. Produces a canonical `user_message` record and projects with `purpose: 'user'` in the conversation. `attachments` carries images for vision-capable models — `{ type: 'image', data, mimeType, filename? }` — and documents — `{ type: 'document', data, mimeType: 'application/pdf', filename? }`. `data` is base64 and capped at 14 MiB of base64 characters per attachment (`14 * 1024 * 1024`). Documents are forwarded to the model as native document content (for PDFs the provider sees extracted text plus a rendered image of every page) rather than text extracted or pages rasterized in your code. Native document input is supported on Anthropic Messages, Google Generative AI / Vertex, and OpenAI (and Azure OpenAI) Responses models; on any other model API the document is replaced in model context with a text placeholder saying it was omitted (and the runtime logs a one-time warning per API). Other document MIME types are rejected with `invalid_request` (400).
 - `kind: 'signal'` — everything beyond a direct 1:1 exchange, and the right shape for most channels: each participant's or system's activity, with sender identity and structured metadata in `attributes` and the content in `body`. Signals render into model context as an XML-tagged block, not a chat turn.
   - `type` — caller-defined event type, e.g. `'slack.message'`. Non-empty. [Framework-reserved types](#dynamic-resources) are rejected at admission on every transport.
   - `body` — a plain string. JSON-stringify structured payloads yourself.
@@ -411,6 +417,7 @@ interface PromptOptions<S extends v.GenericSchema | undefined = undefined> {
   thinkingLevel?: ThinkingLevel;
   signal?: AbortSignal;
   images?: PromptImage[];
+  documents?: PromptDocument[];
 }
 ```
 
@@ -420,6 +427,7 @@ interface PromptOptions<S extends v.GenericSchema | undefined = undefined> {
 - `thinkingLevel` — reasoning-effort override for this call. See [`ThinkingLevel`](/docs/reference/agent-hooks-api/#usemodel).
 - `signal` — external abort signal, merged with the handle's own.
 - `images` — inline images attached to the operation's user message (`PromptImage` re-exports pi-ai's `ImageContent`: `{ type: 'image', data, mimeType }`). Requires a vision-capable model.
+- `documents` — inline documents attached to the operation's user message: `{ type: 'document', data, mimeType: 'application/pdf' }`, with `data` base64. Forwarded as native document content, like a document [`DeliveredAttachment`](#deliveredmessage). Native document input is supported on Anthropic Messages, Google Generative AI / Vertex, and OpenAI (and Azure OpenAI) Responses models; on any other model API the document is replaced in model context with a text placeholder saying it was omitted (and the runtime logs a one-time warning per API). An unsupported `mimeType` throws.
 
 ```ts
 interface PromptResponse {
@@ -492,6 +500,8 @@ function defineTool<...>(options: {
   output?: ToolOutputSchema; // Valibot schema
   harness?: boolean;
   durable?: boolean;
+  timeoutMs?: number; // milliseconds
+  annotations?: McpToolAnnotations;
   run(context: ToolContext<...>): ToolRunEnvelope<Output> | string | void | Promise<ToolRunEnvelope<Output> | string | void>;
 }): ToolDefinition;
 ```
@@ -502,6 +512,8 @@ A typing and validation helper: it validates the definition and returns it froze
 - `input` — a Valibot schema for the call's arguments. Must be a top-level object schema (the model sends a JSON object); anything else throws. When present, the parsed output arrives as `context.data`, typed by inference. When absent, the tool receives no `data` property and callers' arguments are ignored.
 - `output` — a Valibot schema for the return value. When present, the runtime parses the returned value through it before recording; a mismatch throws `ToolOutputValidationError`, and a schema producing `undefined` throws `ToolOutputSerializationError`.
 - `harness`, `durable` — capability flags, detailed below. Must be booleans when present.
+- `timeoutMs` — an optional bound on one call's execution, in milliseconds. On expiry the harness aborts the tool's `context.signal` and settles the call with a `ToolTimeoutError` (a tool error the model sees, so the conversation continues); the submission's durability timeout remains the outer backstop. See [Bounded tools](/docs/guide/tools/#bounded-tools).
+- `annotations` — optional MCP-compatible tool hints: `title`, `readOnlyHint`, `destructiveHint`, `idempotentHint`, and `openWorldHint`. [`createMcpConnection()`](#createmcpconnection) copies these from each server `tools/list` entry; wrappers can preserve them and application code can use them when deciding whether a call needs approval. The runtime does not alter execution from these hints. Treat them as untrusted unless you trust the MCP server that supplied them.
 - `run` — the implementation. May be async, and returns a `ToolRunEnvelope` — `{ output?, terminate? }`. `output` is the tool's result: it must be JSON-serializable, is snapshotted as JSON-compatible data, and is then JSON-stringified for the model; non-serializable output throws `ToolOutputSerializationError`. Returning a bare `string` is shorthand for `{ output: <string> }`, and returning nothing (`void`) is allowed only when no `output` schema is declared, reaching the model as `null`; any other bare return — a plain object, array, number, boolean, or `null` — throws, telling you to wrap it as `{ output: <value> }`. `terminate: true` ends the agent's turn once the current tool batch settles, the same loop-ending contract `finish`/`give_up` use — a multi-tool batch ends the turn only when every result in it terminates, a throwing tool never terminates, and the flag is recorded on the tool's canonical outcome, so termination survives a crash between the batch committing and the submission settling. Throwing inside `run` records a tool error the model sees; it does not fail the submission.
 - Arguments that fail the `input` schema throw `ToolInputValidationError` before `run` is invoked; the model receives the validation failure as the tool result and may retry.
 
@@ -542,6 +554,7 @@ The helper types `ToolInput<TTool>` and `ToolOutput<TTool>` extract a tool's inf
 
 - `harness: true` — `run` receives `harness`, the one interface to the agent's environment (`harness.sandbox`) and to models (`harness.prompt()`). Harness invocations are scoped to the tool call, count against the delegation-depth cap, and retain any child conversations they open. Harness tools only run inside an agent session, never standalone. Tools without the flag are pure functions of their data and cannot reach the runtime.
 - `durable: true` — `run` receives `step`, and every side effect in the run is expected to go through `step.do(...)`. In exchange, an interrupted call is re-executed on recovery — completed steps replay their recorded values instead of running again — rather than being settled with an unknown-outcome error like ordinary tools. See [Durable tools and `step.do`](/docs/guide/durability/#durable-tools-and-stepdo).
+- `timeoutMs: <ms>` — a per-call execution bound. When the deadline expires, the harness aborts the tool's `context.signal` and settles the call with `ToolTimeoutError` — the model sees `Tool "<name>" timed out after <ms>ms` as the tool's error result and the conversation continues; the abandoned run's late settlement is discarded, and a host abort still lands as an abort, not a timeout.
 
 The flags compose: a `durable: true, harness: true` tool receives both `step` and `harness` (wrap `harness.prompt(...)` in a step to avoid re-prompting on recovery).
 
@@ -589,7 +602,7 @@ Equivalent to a skill directory: `instructions` is the `SKILL.md` body, and `fil
 - `instructions` — the skill's content, loaded on activation. Required, non-empty — a skill is its content, so a definition with no instructions is rejected rather than mounted as an empty catalog line.
 - `license`, `compatibility` — optional strings recorded in the packaged frontmatter (`compatibility` at most 500 characters).
 - `metadata` — a string-to-string map recorded in frontmatter.
-- `allowedTools` — space-separated pre-approved tools (experimental in the Agent Skills spec).
+- `allowedTools` — space-separated tool names the skill author prefers (experimental in the Agent Skills spec). Accepted for compatibility; Flue does not enforce it.
 - `files` — supporting resources keyed by path relative to the skill root. Paths must be safe relative paths (no leading `/`, no `.`/`..` segments, no backslashes) and must not be `SKILL.md` itself. Content is a string or `Uint8Array`.
 
 ## `defineSubagent()`
@@ -690,6 +703,7 @@ Definition fields are documented at [`McpConnectionDefinition`](#mcpconnectionde
 
 - Adapted tool names take the form `mcp__<server>__<tool>`; characters outside `[A-Za-z0-9_-]` are replaced with underscores. Duplicate adapted names reject the connection.
 - Adapted descriptions carry the server's own tool description (and `Title:` when the server provides a distinct one). The original tool and server names are spelled out only when sanitization altered a name part — otherwise the adapted name already encodes both.
+- Adapted definitions preserve the server's `annotations` object, including `readOnlyHint`, `destructiveHint`, `idempotentHint`, and `openWorldHint`, so trusted application code can inspect the hints before mounting or wrapping a tool. MCP annotations are server-supplied hints, not a security boundary; only base approval policy on them when you trust the server.
 - Tool discovery follows `tools/list` pagination; a repeated cursor throws. Tools that require task-based execution are skipped with a console warning (allowlisting one is an error).
 - `auth` resolves before every request; a 401 re-resolves once and retries, so a credential the application has already refreshed recovers in place.
 - A tool result's content is flattened to text for the model; a result with `isError` becomes a tool error. When the server declares an output schema, the MCP client validates structured content against it and a mismatch is an error.

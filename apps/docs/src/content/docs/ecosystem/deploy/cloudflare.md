@@ -1,7 +1,7 @@
 ---
 title: Deploy to Cloudflare
 description: Build and deploy Flue agents on Cloudflare Workers with Vite.
-lastReviewedAt: 2026-07-21
+lastReviewedAt: 2026-09-14
 ---
 
 Build and deploy Flue agents on Cloudflare Workers. This guide walks you through the different kinds of agents you can build — from simple prompt-and-response endpoints to full coding agents backed by persistent storage and remote sandboxes.
@@ -27,20 +27,21 @@ Flue builds on `agents`, Cloudflare's Agents SDK — it uses the SDK's Durable O
 
 ```ts title="vite.config.ts"
 import { cloudflare } from '@cloudflare/vite-plugin';
-import { flue } from '@flue/vite';
+import { flue, flueWorkerConfig } from '@flue/vite';
 import { defineConfig } from 'vite';
 
 // flue() must come before cloudflare(): it prepares the generated Worker
 // entry and the merged wrangler config that the Cloudflare plugin consumes.
-// The cloudflare target is auto-detected from the presence of cloudflare()
-// in the plugin array.
+// Pass flueWorkerConfig() to cloudflare() so the plugin picks up that
+// generated Worker entry and per-agent Durable Object bindings.
 export default defineConfig({
-  plugins: [flue(), cloudflare()],
+  plugins: [flue(), cloudflare({ config: flueWorkerConfig() })],
 });
 ```
 
 ```jsonc title="package.json"
 {
+  "type": "module",
   "scripts": {
     "dev": "vite dev",
     "build": "vite build",
@@ -48,6 +49,8 @@ export default defineConfig({
   },
 }
 ```
+
+`"type": "module"` is required: `@cloudflare/vite-plugin` is ESM-only, and without it Vite loads `vite.config.ts` with `require()` and fails to resolve the plugin.
 
 ### 2. Create your first agent
 
@@ -334,6 +337,8 @@ Cloudflare has native container support via [`@cloudflare/sandbox`](https://deve
 If you'd rather connect to an external provider — e.g. Daytona — instead of running the sandbox on Cloudflare, see [Connect a Daytona Sandbox](/docs/ecosystem/sandboxes/daytona/).
 
 ### Setup
+
+Containers are a [Workers Paid](https://developers.cloudflare.com/sandbox/platform/pricing/) feature, and local development with `vite dev` needs the Docker daemon running to build and start the container image.
 
 You own the container config. That means four things:
 

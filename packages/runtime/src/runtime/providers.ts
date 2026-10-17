@@ -51,7 +51,7 @@ export function resetModelsForTests(): void {
  * Register a built-in provider from its
  * `@earendil-works/pi-ai/providers/<id>` module namespace. Generated entries
  * call this: picking the factory out of the namespace keeps pi's exact export
- * names (`anthropicProvider`, `azureOpenAIResponsesProvider`, …) out of
+ * names (`anthropicProvider`, `azureProvider`, …) out of
  * generated code, so pi's naming can't drift out from under it. Skips IDs
  * that are already registered so `app.ts` overrides win regardless of module
  * evaluation order.
@@ -91,7 +91,7 @@ export function providerTelemetryName(providerId: string): string {
 		{
 			'amazon-bedrock': 'aws.bedrock',
 			anthropic: 'anthropic',
-			'azure-openai-responses': 'azure.ai.openai',
+			azure: 'azure.ai.openai',
 			deepseek: 'deepseek',
 			google: 'gcp.gemini',
 			'google-vertex': 'gcp.vertex_ai',
@@ -124,13 +124,50 @@ type ProviderWithDynamicModels = Provider & {
 	[DYNAMIC_MODEL_TEMPLATE]?: DynamicModelTemplate;
 };
 
-/** Zero-metadata Model literal for ids no catalog knows. */
+/**
+ * Marker carried by every model synthesized from a dynamic model template.
+ *
+ * pi-ai's `Model` type has no "unknown metadata" state: `cost` must remain a
+ * zero table (its `calculateCost` dereferences it unconditionally — omitting
+ * it would crash every stream call), and `contextWindow`/`maxTokens` are `0`,
+ * which `shouldCompact` already treats as "unknown". Use {@link isDynamicModel}
+ * to tell "free" apart from "not yet known" when reading cost or budgeting.
+ */
+export const DYNAMIC_MODEL_MARKER = Symbol.for('flue.dynamicModelMarker');
+
+/** True when `model` was synthesized from a dynamic model template. */
+export function isDynamicModel(model: Model<Api>): boolean {
+	return (model as Model<Api> & { [DYNAMIC_MODEL_MARKER]?: true })[DYNAMIC_MODEL_MARKER] === true;
+}
+
+/** One-time per process: the template escape hatch was used. */
+let warnedAboutDynamicModelSynthesis = false;
+function warnDynamicModelSynthesis(providerId: string, modelId: string): void {
+	if (warnedAboutDynamicModelSynthesis) return;
+	warnedAboutDynamicModelSynthesis = true;
+	console.warn(
+		`[flue] Model "${providerId}/${modelId}" is not in the provider's catalog and was ` +
+			`synthesized from a dynamic model template. Its cost reads as $0 and it has no known ` +
+			`context window — detect such models with isDynamicModel() from "@flue/runtime".`,
+	);
+}
+
+/** Reset the one-time dynamic-model warning guard. Test-only. */
+export function resetDynamicModelWarnForTests(): void {
+	warnedAboutDynamicModelSynthesis = false;
+}
+
+/**
+ * Zero-metadata Model literal for ids no catalog knows. Carries the
+ * {@link DYNAMIC_MODEL_MARKER} so consumers can tell "free" (real zero-cost
+ * models) from "unknown" (synthesized) metadata.
+ */
 function zeroMetadataModel(
 	providerId: string,
 	modelId: string,
 	template: DynamicModelTemplate,
 ): Model<Api> {
-	return {
+	const model: Model<Api> = {
 		id: modelId,
 		name: modelId,
 		api: template.api,
@@ -143,6 +180,8 @@ function zeroMetadataModel(
 		contextWindow: 0,
 		maxTokens: 0,
 	};
+	(model as Model<Api> & { [DYNAMIC_MODEL_MARKER]: true })[DYNAMIC_MODEL_MARKER] = true;
+	return model;
 }
 
 // ─── Model resolution ───────────────────────────────────────────────────────
@@ -190,13 +229,71 @@ export function resolveModel(model: string): Model<Api> {
 	const resolved = models.getModel(providerId, modelId);
 	if (resolved) return resolved;
 
+	const aliased = resolveVersionSeparatorAlias(providerId, modelId);
+	if (aliased) return aliased;
+
 	const template = (provider as ProviderWithDynamicModels)[DYNAMIC_MODEL_TEMPLATE];
-	if (template) return zeroMetadataModel(providerId, modelId, template);
+	if (template) {
+		warnDynamicModelSynthesis(providerId, modelId);
+		return zeroMetadataModel(providerId, modelId, template);
+	}
 
 	throw new Error(
 		`[flue] Unknown model ID "${modelId}" for provider "${providerId}". ` +
 			`Declared model IDs: ${listModelIds(providerId)}.`,
 	);
+}
+
+// ─── Version-separator aliases ──────────────────────────────────────────────
+
+/**
+ * Canonical form of a model ID for version-separator matching: a `-` or `.`
+ * between two digits becomes `.`, so `claude-sonnet-4-6` and
+ * `claude-sonnet-4.6` compare equal.
+ */
+function versionSeparatorKey(modelId: string): string {
+	return modelId.replace(/(?<=\d)[-.](?=\d)/g, '.');
+}
+
+/** One warning per requested specifier: the alias fallback was used. */
+const warnedVersionSeparatorAliases = new Set<string>();
+
+/** Reset the version-separator alias warning guard. Test-only. */
+export function resetVersionSeparatorAliasWarnForTests(): void {
+	warnedVersionSeparatorAliases.clear();
+}
+
+/**
+ * Resolve an undeclared model ID that differs from exactly one declared ID
+ * only in its version separators (`-` vs `.` between digits).
+ *
+ * pi-ai catalogs occasionally rename IDs between these forms (pi 0.84.3 moved
+ * the `cloudflare-ai-gateway` Claude models from `claude-sonnet-4-6` to
+ * `claude-sonnet-4.6`), and Cloudflare's binding catalog names models with
+ * dots where Anthropic uses dashes. Without this, a renamed ID becomes a hard
+ * `Unknown model ID` failure for every existing specifier. Ambiguous matches
+ * resolve to nothing so the regular error still reports them.
+ */
+function resolveVersionSeparatorAlias(providerId: string, modelId: string): Model<Api> | undefined {
+	if (!/\d[-.]\d/.test(modelId)) return undefined;
+	const key = versionSeparatorKey(modelId);
+
+	const candidates = models
+		.getModels(providerId)
+		.filter((model) => model.id !== modelId && versionSeparatorKey(model.id) === key);
+	if (candidates.length !== 1) return undefined;
+
+	const [model] = candidates as [Model<Api>];
+	const requested = `${providerId}/${modelId}`;
+	if (!warnedVersionSeparatorAliases.has(requested)) {
+		warnedVersionSeparatorAliases.add(requested);
+		console.warn(
+			`[flue] Model "${requested}" is not in the provider's catalog; using ` +
+				`"${providerId}/${model.id}", which differs only in version separators. ` +
+				`Update the specifier to "${providerId}/${model.id}".`,
+		);
+	}
+	return model;
 }
 
 function listModelIds(providerId: string): string {

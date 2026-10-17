@@ -68,7 +68,10 @@ export type ContentOption = false | { transform?: ContentTransform };
  * bytes at 64 KiB and silently drops every write after the first overflow,
  * so content shares one pool per span; the 8 KiB left over is slack for the
  * operational attributes (usage, ids, error class) that must always land.
- * Adopted by both backends so the payload contract is identical everywhere.
+ * Adopted by both backends so the payload contract is identical
+ * everywhere; each backend's options accept a `contentBudgetBytes` override
+ * for hosts that don't conform to workerd's span limits (e.g. to ship full
+ * prompts and tool results to a non-workerd observability backend).
  */
 export const CONTENT_BUDGET_BYTES = 57_344;
 
@@ -85,8 +88,10 @@ export interface ContentAttributeOptions {
 	/** Emit string content as-is instead of JSON-encoding it (tool payloads, descriptions, exception text). */
 	rawString?: boolean;
 	/**
-	 * Tighter budget for this attribute, clamped to
-	 * [128, `CONTENT_BUDGET_BYTES`]. Ledger draws pass the pool remainder here.
+	 * Tighter budget for this attribute, floored at 128 bytes. Ledger draws
+	 * pass the pool remainder here; the pool (default `CONTENT_BUDGET_BYTES`,
+	 * overridable per backend) is the ceiling, so a raised pool allows larger
+	 * single attributes.
 	 */
 	maxBytes?: number;
 	traceId?: string;
@@ -95,11 +100,47 @@ export interface ContentAttributeOptions {
 
 export interface ContentAttributeResult {
 	value?: string;
-	/** Post-transform value was a plain object — decides `gen_ai.tool.call.*` vs the `flue.*` raw fallback keys. */
+	/**
+	 * @deprecated Retained for source compatibility. Tool payloads of every
+	 * shape record under the semconv `gen_ai.tool.call.*` keys, so this no
+	 * longer selects an attribute key. Reports whether the post-transform
+	 * value was a plain object (serialized-object strings report `false`, as
+	 * they always have).
+	 */
 	objectShaped?: boolean;
 }
 
 const ENCODER = new TextEncoder();
+
+/** Content types whose value must stay an array of role/parts messages. */
+const MESSAGE_CONTENT_TYPES: ReadonlySet<GenAIContentType> = new Set([
+	'input_messages',
+	'output_messages',
+]);
+
+/**
+ * Shape-preserving fallback for message-array content types: the GenAI
+ * semconv schema requires `gen_ai.input.messages` / `gen_ai.output.messages`
+ * to be arrays of `{ role, parts }` messages (output messages also carry
+ * `finish_reason`). A bare diagnostic string would violate that contract, so
+ * serialization/transform failures emit the envelope instead. The envelope
+ * (~90 bytes) always fits the 128-byte minimum budget.
+ */
+function messageContentFallback(
+	diagnostic: string,
+	options: ContentAttributeOptions,
+): string | undefined {
+	return serialize(
+		[
+			{
+				role: 'flue',
+				parts: [{ type: 'text', content: diagnostic }],
+				...(options.contentType === 'output_messages' ? { finish_reason: 'error' } : {}),
+			},
+		],
+		options,
+	);
+}
 
 export function contentAttribute(
 	policy: ContentOption | undefined,
@@ -117,20 +158,36 @@ export function contentAttribute(
 		try {
 			value = policy.transform(structuredClone(content), contentScope(event, options));
 		} catch {
-			return { value: CONTENT_TRANSFORM_FAILED };
+			return MESSAGE_CONTENT_TYPES.has(options.contentType)
+				? {
+						value:
+							messageContentFallback(CONTENT_TRANSFORM_FAILED, options) ?? CONTENT_TRANSFORM_FAILED,
+					}
+				: { value: CONTENT_TRANSFORM_FAILED };
 		}
 		if (value === undefined) return {};
 	}
 	const objectShaped = isPlainObject(value);
 	const budget =
 		typeof options.maxBytes === 'number' && Number.isFinite(options.maxBytes)
-			? Math.min(Math.max(Math.floor(options.maxBytes), MIN_BUDGET_BYTES), CONTENT_BUDGET_BYTES)
+			? Math.max(Math.floor(options.maxBytes), MIN_BUDGET_BYTES)
 			: CONTENT_BUDGET_BYTES;
 	let serialized = serialize(value, options);
-	if (serialized === undefined) return { value: CONTENT_UNSERIALIZABLE };
+	if (serialized === undefined) {
+		return MESSAGE_CONTENT_TYPES.has(options.contentType)
+			? { value: messageContentFallback(CONTENT_UNSERIALIZABLE, options) ?? CONTENT_UNSERIALIZABLE }
+			: { value: CONTENT_UNSERIALIZABLE };
+	}
 	if (ENCODER.encode(serialized).byteLength > budget) {
 		serialized = serialize(truncateContent(value, { maxBytes: budget }), options);
-		if (serialized === undefined) return { value: CONTENT_UNSERIALIZABLE };
+		if (serialized === undefined) {
+			return MESSAGE_CONTENT_TYPES.has(options.contentType)
+				? {
+						value:
+							messageContentFallback(CONTENT_UNSERIALIZABLE, options) ?? CONTENT_UNSERIALIZABLE,
+					}
+				: { value: CONTENT_UNSERIALIZABLE };
+		}
 	}
 	return { value: serialized, objectShaped };
 }
@@ -149,14 +206,32 @@ const INPUT_CONTENT_TYPES: ReadonlySet<GenAIContentType> = new Set([
  * a pool too dry for real content still emits the in-band truncation
  * sentinels at the 128-byte floor, and that overshoot (bounded by the
  * handful of content attributes a span carries) lands in the operational
- * slack above `CONTENT_BUDGET_BYTES`.
+ * slack above `CONTENT_BUDGET_BYTES`. The pool defaults to
+ * `CONTENT_BUDGET_BYTES`; backends thread a configurable `contentBudgetBytes`
+ * through when their host does not need workerd's span limits.
  */
 export interface ContentLedger {
 	remaining: number;
 }
 
-export function createContentLedger(): ContentLedger {
-	return { remaining: CONTENT_BUDGET_BYTES };
+export function assertContentBudgetBytes(
+	budgetBytes: unknown,
+): asserts budgetBytes is number | undefined {
+	if (budgetBytes === undefined) return;
+	if (
+		typeof budgetBytes !== 'number' ||
+		!Number.isSafeInteger(budgetBytes) ||
+		budgetBytes < MIN_BUDGET_BYTES
+	) {
+		throw new TypeError(
+			`contentBudgetBytes must be a safe integer of at least ${MIN_BUDGET_BYTES} bytes; got ${String(budgetBytes)}.`,
+		);
+	}
+}
+
+export function createContentLedger(budgetBytes?: number): ContentLedger {
+	assertContentBudgetBytes(budgetBytes);
+	return { remaining: budgetBytes === undefined ? CONTENT_BUDGET_BYTES : budgetBytes };
 }
 
 export interface ContentDrawOptions extends Omit<ContentAttributeOptions, 'maxBytes'> {

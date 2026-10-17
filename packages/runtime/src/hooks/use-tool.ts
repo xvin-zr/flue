@@ -1,3 +1,4 @@
+import type { McpToolAnnotations } from '../mcp-types.ts';
 import { assertToolDefinition } from '../tool.ts';
 import type { ToolDefinition, ToolInputSchema, ToolOutputSchema } from '../tool-types.ts';
 import { requireRenderFrame } from './frame.ts';
@@ -42,6 +43,18 @@ export function useTool<
 	 * recovery with completed steps replaying their recorded values.
 	 */
 	durable?: TDurable;
+	/**
+	 * Optional bound on one call's execution, in milliseconds. On expiry the
+	 * harness aborts the tool's `context.signal` and settles the call with a
+	 * `ToolTimeoutError` — the conversation continues.
+	 */
+	timeoutMs?: number;
+	/**
+	 * MCP tool annotations (from an adapted MCP tool or mirroring one in a
+	 * wrapper). The runtime ignores the field; application code reads the
+	 * hints to gate calls.
+	 */
+	annotations?: McpToolAnnotations;
 	run: ToolDefinition<TInput, TOutput, THarness, TDurable>['run'];
 }): void;
 // A definition whose schema generics are already erased to the defaults

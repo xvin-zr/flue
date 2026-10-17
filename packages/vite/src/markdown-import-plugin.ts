@@ -28,6 +28,8 @@ import { parserLangForFile } from './agent-scan.ts';
 import { canonicalizePath, isWithinDirectory } from './paths.ts';
 
 const MARKDOWN_MODULE_PREFIX = '\0flue-markdown:';
+/** Virtual registry owned by the Agents SDK's `agents()` Vite plugin. */
+const AGENTS_SKILLS_VIRTUAL_PREFIX = '\0agents:skills:';
 const SKILL_MODULE_PREFIX = '\0flue-skill:';
 const ENCODED_SKILL_MODULE_PREFIX = '__x00__flue-skill:';
 const PACKAGED_FILE_WARNING_BYTES = 1024 * 1024;
@@ -100,7 +102,7 @@ export function markdownImportPlugin(): Plugin {
 					if (!resolved || resolved.external) {
 						throw new Error(`[flue] Unable to resolve markdown import: ${declaration.specifier}`);
 					}
-					const filesystemPath = stripQueryAndHash(resolved.id);
+					const filesystemPath = resolvedFilesystemPath(resolved.id);
 					if (!path.isAbsolute(filesystemPath)) {
 						throw new Error(
 							`[flue] Markdown imports must resolve to a filesystem path: ${declaration.specifier}`,
@@ -146,7 +148,13 @@ export function markdownImportPlugin(): Plugin {
 				);
 			}
 			if (!importer) return null;
-			if (isSkillMarkdownPath(source)) {
+			// The Agents SDK builds its own virtual skill registry by reading
+			// SKILL.md files. Those edges belong to that plugin, not Flue's static
+			// JS/TS import transform.
+			if (importer.startsWith(AGENTS_SKILLS_VIRTUAL_PREFIX)) return null;
+			// Queried specifiers are delegated to Vite by the transform, so the
+			// untransformed-skill guard only applies to query-less edges.
+			if (importQuery(source) === undefined && isSkillMarkdownPath(source)) {
 				// The transform packages these automatically; reaching raw
 				// resolution means the importer was outside the transform's
 				// module filter (a non-JS/TS importer, say).
@@ -294,11 +302,30 @@ function decodeSkillModuleId(
 }
 
 function stripQueryAndHash(specifier: string): string {
-	return specifier.split(/[?#]/, 1)[0] ?? specifier;
+	// A leading `#` is a Node subpath import (package.json `imports`, e.g.
+	// `#src/...`), not a fragment: it survives. The first `?` or `#` after
+	// that leading `#` (or in any position otherwise) is a Vite query or
+	// fragment suffix and is cut, along with everything after it.
+	const offset = specifier.startsWith('#') ? 1 : 0;
+	const suffixIndex = specifier.slice(offset).search(/[?#]/);
+	if (suffixIndex === -1) return specifier;
+	return specifier.slice(0, offset + suffixIndex);
 }
 
 function isSkillMarkdownPath(specifier: string): boolean {
 	return path.basename(stripQueryAndHash(specifier)) === 'SKILL.md';
+}
+
+/**
+ * The filesystem path behind a Vite-resolved module id. `#` and `?` are legal
+ * in POSIX file and directory names (and `#` on Windows), so an absolute id
+ * that exists exactly is used as-is — only a Vite query/hash postfix is
+ * stripped as a fallback. Raw import specifiers (handled by
+ * {@link stripQueryAndHash}) and resolved ids do not share a grammar.
+ */
+function resolvedFilesystemPath(resolvedId: string): string {
+	if (path.isAbsolute(resolvedId) && fs.existsSync(resolvedId)) return resolvedId;
+	return stripQueryAndHash(resolvedId);
 }
 
 interface ModuleAst {
