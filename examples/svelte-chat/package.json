@@ -12,9 +12,9 @@
 		"@earendil-works/pi-ai": "^0.83.0",
 		"@flue/runtime": "workspace:*",
 		"@flue/sdk": "workspace:*",
-		"@flue/svelte": "workspace:*",
 		"@hono/node-server": "^2.0.3",
-		"hono": "4.12.32"
+		"hono": "4.12.32",
+		"flue-svelte": "workspace:*"
 	},
 	"devDependencies": {
 		"@flue/vite": "workspace:*",

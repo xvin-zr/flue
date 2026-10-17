@@ -1,7 +1,10 @@
 import {
+	type AgentSendResult,
 	type ConversationLiveMode,
 	createFlueClient,
 	type DeliveredAttachment,
+	type DeliveredDocumentAttachment,
+	type DeliveredImageAttachment,
 	type FlueClient,
 	type FlueConversationMessage,
 	type FlueConversationPart,
@@ -30,6 +33,12 @@ export interface UseFlueAgentOptions {
 	readonly url?: string;
 	readonly client?: FlueClient;
 	readonly live?: ConversationLiveMode;
+	/**
+	 * Hydrate only the newest `limit` messages instead of the whole conversation.
+	 * See `AgentConversationObserveOptions.limit` on `@flue/sdk`. When set, the
+	 * snapshot's `before` cursor pages older messages via `client.historyBefore()`.
+	 */
+	readonly limit?: number;
 }
 
 export interface UseFlueAgentResult {
@@ -39,7 +48,8 @@ export interface UseFlueAgentResult {
 	readonly error: Error | undefined;
 	readonly failedSends: readonly FailedSend[];
 	readonly settlements: readonly FlueConversationSettlement[];
-	sendMessage(message: string, options?: SendMessageOptions): Promise<void>;
+	readonly before: string | null | undefined;
+	sendMessage(message: string, options?: SendMessageOptions): Promise<AgentSendResult>;
 	refresh(): void;
 }
 
@@ -49,6 +59,7 @@ export function useFlueAgent(
 	let snapshot = $state.raw<AgentSnapshot>(emptySnapshot);
 	let identity: FlueClient | string | undefined;
 	let live: ConversationLiveMode = 'sse';
+	let limit: number | undefined;
 	let session: AgentSession | undefined;
 	let unsubscribeSession: (() => void) | undefined;
 
@@ -56,7 +67,8 @@ export function useFlueAgent(
 		const options = getOptions();
 		const nextIdentity = options.client ?? options.url;
 		const nextLive = options.live ?? 'sse';
-		if (nextIdentity === identity && nextLive === live) return;
+		const nextLimit = options.limit;
+		if (nextIdentity === identity && nextLive === live && nextLimit === limit) return;
 
 		untrack(() => {
 			if (nextIdentity === undefined) {
@@ -64,6 +76,7 @@ export function useFlueAgent(
 				const unsubscribePrevious = unsubscribeSession;
 				identity = undefined;
 				live = nextLive;
+				limit = nextLimit;
 				session = undefined;
 				unsubscribeSession = undefined;
 				snapshot = emptySnapshot;
@@ -73,7 +86,7 @@ export function useFlueAgent(
 			}
 
 			const client = options.client ?? createFlueClient({ url: options.url as string });
-			const candidate = new AgentSession(client, nextLive);
+			const candidate = new AgentSession(client, nextLive, nextLimit);
 			let candidateSnapshot = candidate.getSnapshot();
 			let committed = false;
 			const unsubscribeCandidate = candidate.subscribe(() => {
@@ -91,6 +104,7 @@ export function useFlueAgent(
 			const unsubscribePrevious = unsubscribeSession;
 			identity = nextIdentity;
 			live = nextLive;
+			limit = nextLimit;
 			session = candidate;
 			unsubscribeSession = unsubscribeCandidate;
 			snapshot = candidateSnapshot;
@@ -127,6 +141,9 @@ export function useFlueAgent(
 		get settlements() {
 			return snapshot.settlements;
 		},
+		get before() {
+			return snapshot.before;
+		},
 		async sendMessage(message, options) {
 			if (!session) throw new Error('useFlueAgent() cannot send without a conversation url');
 			return session.sendMessage(message, options);
@@ -140,7 +157,10 @@ export function useFlueAgent(
 export type { AgentStatus, FailedSend } from './agent-reducer.ts';
 export type { SendMessageOptions } from './agent-session.ts';
 export type {
+	AgentSendResult,
 	DeliveredAttachment,
+	DeliveredDocumentAttachment,
+	DeliveredImageAttachment,
 	FlueClient,
 	FlueConversationMessage,
 	FlueConversationPart,

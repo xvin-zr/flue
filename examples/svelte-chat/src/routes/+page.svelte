@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { useFlueAgent } from '@flue/svelte';
+	import { useFlueAgent } from 'flue-svelte';
 	import { onMount } from 'svelte';
 
 	let conversationId = $state<string>();
