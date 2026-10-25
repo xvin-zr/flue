@@ -1,6 +1,6 @@
 {
 	"name": "flue-svelte",
-	"version": "0.1.2",
+	"version": "2.3.0",
 	"description": "Community-maintained, unofficial Svelte 5 adapter for Flue conversations",
 	"//": "Modified for community distribution: independent package identity and public SDK dependency; see NOTICE.",
 	"type": "module",

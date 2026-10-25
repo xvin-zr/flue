@@ -1,5 +1,39 @@
 # flue-svelte release record
 
+## 2.3.0 candidate — SDK 2.3.0
+
+Prepared on 2026-10-25; publication reported by the maintainer, **registry
+verification pending**. The version matches `@flue/react`
+and `@flue/sdk`. This release requires exactly
+`@flue/sdk@2.3.0` and retains the Svelte `^5.3.0` peer range.
+
+Validation:
+
+- Package build, typecheck, and all 7 committed tests passed. Typechecking reports
+  the existing warning about no `.svelte` input files in this rune-module package.
+- The packed archive contains only `package.json`, `README.md`, `LICENSE`, `NOTICE`,
+  `dist/index.svelte.js`, and `dist/index.svelte.d.ts`.
+- A fresh consumer outside the workspace installed the archive and public SDK
+  `2.3.0`. Declaration typechecking, production client compilation, SSR compilation,
+  and rendering the dormant hook (`idle:false:0`) passed with both Svelte `5.56.8`
+  / plugin `7.3.0` / Vite `8.2.1` and Svelte `5.3.0` / plugin `5.0.3` / Vite `6.0.11`.
+  Browser execution and live backend transport were not tested in this pass.
+- `npm publish <archive> --dry-run --access public --registry=https://registry.npmjs.org`
+  passed. This does not prove publishing permission.
+- The workspace example typecheck is blocked by an unrelated Pi provider type
+  mismatch (`@earendil-works/pi-ai` versions `0.83.0` and `1.1.0`).
+
+Archive SHA-1: `22b5f3fdc20812e8cf41622cd5dde53e96b83513`.
+Archive integrity:
+`sha512-1l/kB0qlQp8Nkql8hn3Lw7wj/VMbY3MiHzyF60sIPYK4f70rQfSrKmcde0vD/85bmPooHPpHpJnPo5ABuz06aQ==`.
+
+The initial agent-side publish attempt stopped with `EOTP`. The maintainer then
+reported completing publication interactively. A subsequent public registry lookup
+still returned HTTP 404 for `flue-svelte@2.3.0`, with `latest` pointing to `0.1.2`.
+Recheck the registry version and integrity before treating publication as verified.
+
+## Historical release records
+
 `flue-svelte@0.1.2` is published on npm with SDK `2.0.5` compatibility.
 Registry tarball SHA-1: `3ce8d33c0fd8cef0d302be9e4311462fad4cf07b`.
 This is an unofficial community package. The implementation and conversation
