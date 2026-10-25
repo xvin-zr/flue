@@ -32,11 +32,11 @@
 		"test": "vitest run"
 	},
 	"peerDependencies": {
-		"@flue/sdk": "2.0.5",
+		"@flue/sdk": "2.3.0",
 		"svelte": "^5.3.0"
 	},
 	"devDependencies": {
-		"@flue/sdk": "2.0.5",
+		"@flue/sdk": "2.3.0",
 		"@sveltejs/vite-plugin-svelte": "^7.3.0",
 		"happy-dom": "^20.11.0",
 		"svelte": "^5.56.8",

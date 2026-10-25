@@ -14,16 +14,18 @@
  */
 import type { Ai } from '@cloudflare/workers-types';
 import type {
+	AnthropicEffort,
 	AnthropicOptions,
 	AssistantMessage,
-	Context,
 	Model,
 	OpenAICompletionsCompat,
 	Provider,
 	ProviderStreams,
 	SimpleStreamOptions,
+	ThinkingLevel,
 	Tool,
 	ToolCall,
+	TranscriptContext,
 	Usage,
 } from '@earendil-works/pi-ai';
 import {
@@ -31,7 +33,9 @@ import {
 	clampThinkingLevel,
 	createAssistantMessageEventStream,
 	createProvider,
+	getCurrentTools,
 	parseStreamingJson,
+	resolveTranscriptTools,
 } from '@earendil-works/pi-ai';
 // Protocol implementations load lazily, matching pi's own provider design:
 // the worker entry imports this module in every isolate, but the ~90KB of
@@ -42,6 +46,7 @@ import { cloudflareWorkersAIProvider } from '@earendil-works/pi-ai/providers/clo
 import { CloudflareAIBindingError, RETRYABLE_INTERRUPTION_MARKER } from '../errors.ts';
 import { attachProviderResponseDiagnostics } from '../provider-diagnostics.ts';
 import { DYNAMIC_MODEL_TEMPLATE } from '../runtime/providers.ts';
+import { prepareAnthropicBindingRequest } from './anthropic-binding-request.ts';
 import type { CloudflareGatewayOptions } from './gateway.ts';
 
 /**
@@ -54,27 +59,28 @@ const CLOUDFLARE_AI_BINDING_API = 'cloudflare-ai-binding' as const;
 // ─── OpenAI-completions compat profile ──────────────────────────────────────
 
 /**
- * Mirrors pi-ai's effective compat for Workers AI models: `getCompat()`, i.e.
- * `detectCompat('cloudflare-workers-ai')` plus the per-model `compat`
- * overrides in pi-ai's model registry (which set `sendSessionAffinityHeaders:
- * true`; `detectCompat` alone returns `false`). Hardcoded here because
- * `convertMessages` requires a fully-resolved compat object and the binding's
- * wire format matches `cloudflare-workers-ai` exactly. Re-mirror if pi-ai's
- * detection logic or registry overrides change upstream. Note
- * `sendSessionAffinityHeaders` is inert in this provider — it applies the
- * `x-session-affinity` header itself in `streamCloudflareWorkersAi`.
+ * Base OpenAI-completions compat profile for the Workers AI binding, mirroring
+ * pi-ai's `detectCompat('cloudflare-workers-ai')` result (`sendSessionAffinity-
+ * Headers: true` — `detectCompat` alone returns `false`). Hardcoded here
+ * because `convertMessages` requires a fully-resolved compat object and the
+ * binding's wire format matches `cloudflare-workers-ai` exactly; per-model
+ * catalog overrides are merged over it at request time (see the
+ * chat-completions branch), mirroring pi's `getCompat()`. Re-mirror if
+ * pi-ai's detection logic changes upstream. Note `sendSessionAffinityHeaders`
+ * is inert in this provider — it applies the `x-session-affinity` header
+ * itself in `streamCloudflareWorkersAi`.
  */
 const WORKERS_AI_COMPAT: Omit<
 	Required<OpenAICompletionsCompat>,
-	'cacheControlFormat' | 'deferredToolsMode'
+	'cacheControlFormat' | 'thinkingTokenBudgetField' | 'vllmPriority'
 > & {
 	cacheControlFormat?: OpenAICompletionsCompat['cacheControlFormat'];
-	deferredToolsMode?: OpenAICompletionsCompat['deferredToolsMode'];
 } = {
 	supportsStore: false,
 	supportsDeveloperRole: false,
 	supportsReasoningEffort: true,
 	supportsUsageInStreaming: true,
+	supportsFinishReason: true,
 	maxTokensField: 'max_completion_tokens',
 	requiresToolResultName: false,
 	requiresAssistantAfterToolResult: false,
@@ -82,11 +88,15 @@ const WORKERS_AI_COMPAT: Omit<
 	requiresReasoningContentOnAssistantMessages: false,
 	thinkingFormat: 'openai',
 	chatTemplateKwargs: {},
+	chatTemplateArgs: {},
 	openRouterRouting: {},
 	vercelGatewayRouting: {},
 	zaiToolStream: false,
+	supportsThinkingTokenBudget: false,
 	supportsStrictMode: true,
 	supportsOpenAIGrammarTools: false,
+	supportsMidConvoSystemMessages: false,
+	supportsMidConvoToolAdditions: false,
 	cacheControlFormat: undefined,
 	sendSessionAffinityHeaders: true,
 	sessionAffinityFormat: 'openai',
@@ -366,6 +376,8 @@ function isAbortError(error: unknown): boolean {
 interface CloudflareBindingStreamConfig {
 	gateway: CloudflareGatewayOptions | undefined;
 	streamIdleTimeoutMs: number;
+	/** Anthropic prompt-cache retention for the binding's Anthropic path. */
+	cacheRetention: 'none' | 'short' | 'long';
 }
 
 /**
@@ -392,7 +404,7 @@ function streamCloudflareWorkersAi(
 	ai: Ai,
 	binding: CloudflareBindingStreamConfig,
 	model: Model<Api>,
-	context: Context,
+	context: TranscriptContext,
 	options?: SimpleStreamOptions,
 ) {
 	switch (bindingWireFormat(model)) {
@@ -425,12 +437,18 @@ function streamCloudflareWorkersAi(
 			// Loaded on demand (module-cached after the first call); the static
 			// specifier keeps bundlers chunking it normally.
 			const { convertMessages } = await import('@earendil-works/pi-ai/api/openai-completions');
+			// Per-model catalog compat overrides win over the hardcoded base
+			// profile, mirroring pi's own `getCompat()` (detect + overrides).
+			const compat = {
+				...WORKERS_AI_COMPAT,
+				...(model.compat as OpenAICompletionsCompat | undefined),
+			};
 			const messages = convertMessages(
 				// `convertMessages` is typed for `Model<'openai-completions'>` but
 				// only reads provider/id/reasoning, which our model has.
 				model as unknown as Model<'openai-completions'>,
 				context,
-				WORKERS_AI_COMPAT,
+				compat,
 			);
 
 			const payload: Record<string, unknown> = {
@@ -438,8 +456,13 @@ function streamCloudflareWorkersAi(
 				stream: true,
 				stream_options: { include_usage: true },
 			};
-			if (context.tools && context.tools.length > 0) {
-				payload.tools = convertTools(context.tools);
+			// The binding receives a transcript context: tool declarations ride in
+			// the transcript's system messages, never in `context.tools`. The
+			// completions wire format has no mid-convo additions channel, so the
+			// request always carries the full current tool set.
+			const requestTools = getCurrentTools(context.messages);
+			if (requestTools.length > 0) {
+				payload.tools = convertTools(requestTools);
 			}
 			if (options?.maxTokens) {
 				// Workers AI uses `max_completion_tokens` (see WORKERS_AI_COMPAT).
@@ -630,13 +653,14 @@ function streamCloudflareWorkersAi(
 				const delta = choice.delta;
 				if (!delta) continue;
 
-				if (delta.content !== null && delta.content !== undefined && delta.content.length > 0) {
+				const textDelta = normalizeAssistantContent(delta.content);
+				if (textDelta !== undefined && textDelta.length > 0) {
 					const block = ensureTextBlock();
-					block.text += delta.content;
+					block.text += textDelta;
 					stream.push({
 						type: 'text_delta',
 						contentIndex: indexOf(block),
-						delta: delta.content,
+						delta: textDelta,
 						partial: output,
 					});
 				}
@@ -731,24 +755,62 @@ function streamCloudflareWorkersAi(
 	return stream;
 }
 
+/**
+ * Map a thinking level to Anthropic's adaptive-thinking effort. The binding
+ * path calls pi-ai's low-level stream directly, which applies `effort` only
+ * when it is set — pi's `streamSimple` is the only path that maps `reasoning`
+ * to an effort, and this provider does not call it. Mirrors pi's
+ * `mapThinkingLevelToEffort`: a string in the model's `thinkingLevelMap` wins;
+ * otherwise `minimal`/`low` map to `low`, `medium` to `medium`, and everything
+ * else to `high`.
+ */
+function mapThinkingLevelToEffort(
+	model: Model<'anthropic-messages'>,
+	level: ThinkingLevel,
+): AnthropicEffort {
+	const mapped = model.thinkingLevelMap?.[level];
+	if (typeof mapped === 'string') return mapped as AnthropicEffort;
+	switch (level) {
+		case 'minimal':
+		case 'low':
+			return 'low';
+		case 'medium':
+			return 'medium';
+		case 'high':
+			return 'high';
+		default:
+			return 'high';
+	}
+}
+
 function streamCloudflareAnthropicAi(
 	ai: Ai,
 	binding: CloudflareBindingStreamConfig,
 	model: Model<Api>,
-	context: Context,
+	context: TranscriptContext,
 	options?: SimpleStreamOptions,
 ) {
 	warnZeroMetadataGatewayModel(model);
-	const anthropicModel = toAnthropicGatewayModel(model);
+	const anthropicModel = toAnthropicGatewayModel(model, binding.cacheRetention);
 	const client = createAnthropicBindingClient(ai, model, options, binding);
+
+	// pi-ai's low-level stream writes `output_config: { effort }` only when
+	// `effort` is set — the thinking level arrives as `options.reasoning`, which
+	// only its `streamSimple` path maps to an effort. Map it here so
+	// `thinkingLevel` takes effect on adaptive-thinking models.
+	const effort =
+		options?.reasoning && anthropicModel.compat?.forceAdaptiveThinking === true
+			? mapThinkingLevelToEffort(anthropicModel, options.reasoning)
+			: undefined;
 
 	// The lazy shim types options as plain StreamOptions; the impl receives
 	// the Anthropic-specific fields (client, thinkingEnabled) verbatim.
 	const anthropicOptions: AnthropicOptions = {
 		...options,
 		client,
-		cacheRetention: 'none',
+		cacheRetention: binding.cacheRetention,
 		thinkingEnabled: Boolean(options?.reasoning),
+		...(effort ? { effort } : {}),
 		onPayload: async (payload, payloadModel) => {
 			const normalized = normalizeAnthropicGatewayPayload(payload as Record<string, unknown>);
 			const overridden = await options?.onPayload?.(normalized, payloadModel);
@@ -777,7 +839,7 @@ function streamCloudflareResponsesAi(
 	ai: Ai,
 	binding: CloudflareBindingStreamConfig,
 	model: Model<Api>,
-	context: Context,
+	context: TranscriptContext,
 	options?: SimpleStreamOptions,
 ) {
 	const { gateway } = binding;
@@ -808,15 +870,36 @@ function streamCloudflareResponsesAi(
 			]);
 
 			const responsesModel = toResponsesGatewayModel(model);
+			// Deferred tool loading (`additional_tools` / tool_search) is the
+			// model's own channel when its compat advertises it; without it, the
+			// full current tool set rides in the request-level `tools` field.
+			// The three compat booleans mirror pi's own Responses builder
+			// (`buildParams`): independent flags, and request tools resolved
+			// with their OR.
+			const supportsAdditionalTools = responsesModel.compat?.supportsAdditionalTools === true;
+			const supportsToolSearch = responsesModel.compat?.supportsToolSearch === true;
+			const supportsMidConvoSystemMessages =
+				responsesModel.compat?.supportsMidConvoSystemMessages === true;
+			const supportsToolAdditions = supportsAdditionalTools || supportsToolSearch;
 			const payload: Record<string, unknown> = {
 				// `ai.run`'s model argument names the gateway target; like the
 				// chat-completions payload, the body carries no `model` field.
-				input: convertResponsesMessages(responsesModel, context, RESPONSES_TOOL_CALL_ID_PROVIDERS),
+				input: convertResponsesMessages(responsesModel, context, RESPONSES_TOOL_CALL_ID_PROVIDERS, {
+					supportsAdditionalTools,
+					supportsToolSearch,
+					supportsMidConvoSystemMessages,
+				}),
 				stream: true,
 				store: false,
 			};
-			if (context.tools && context.tools.length > 0) {
-				payload.tools = convertResponsesTools(context.tools);
+			// Transcript context: the tool set lives in the transcript's system
+			// messages. `convertResponsesMessages` renders mid-convo additions as
+			// `additional_tools` items only when the model advertises the channel;
+			// request-level tools mirror the same split via the request-tools
+			// projection so added definitions never leak into the cached prefix.
+			const { requestTools } = resolveTranscriptTools(context.messages, supportsToolAdditions);
+			if (requestTools.length > 0) {
+				payload.tools = convertResponsesTools(requestTools);
 			}
 			if (options?.maxTokens) {
 				payload.max_output_tokens = Math.max(options.maxTokens, OPENAI_RESPONSES_MIN_OUTPUT_TOKENS);
@@ -869,9 +952,7 @@ function streamCloudflareResponsesAi(
 				observeResponsesEvents(
 					iterateSseChunks(withStreamIdleDeadline(response.body, binding.streamIdleTimeoutMs)),
 					observed,
-				) as Parameters<
-					typeof processResponsesStream
-				>[0],
+				) as Parameters<typeof processResponsesStream>[0],
 				output,
 				stream,
 				responsesModel,
@@ -1058,13 +1139,29 @@ function unsupportedWireFormatStream(model: Model<Api>) {
 	return stream;
 }
 
-function toAnthropicGatewayModel(model: Model<Api>): Model<'anthropic-messages'> {
+function toAnthropicGatewayModel(
+	model: Model<Api>,
+	cacheRetention: 'none' | 'short' | 'long',
+): Model<'anthropic-messages'> {
+	// The binding dialect forwards `cache_control` on message blocks and tools
+	// to Anthropic, so tool markers are safe to emit when caching is on; the
+	// 1-hour TTL (`supportsLongCacheRetention`) was not verified against the
+	// binding, so 'long' falls back to the 5-minute TTL via pi's own compat
+	// check. `sendSessionAffinityHeaders` is off because flue sends the
+	// affinity header itself (buildExtraHeaders) — and a stable sessionId is
+	// what makes the cache reusable across turns.
+	const caching = cacheRetention !== 'none';
 	return {
 		...model,
 		api: 'anthropic-messages',
 		baseUrl: '',
 		compat: {
-			supportsCacheControlOnTools: false,
+			...model.compat,
+			// pi's Anthropic compat accepts only the openrouter affinity format;
+			// the binding sends `x-session-affinity` itself (buildExtraHeaders),
+			// so drop whatever format the source catalog carried.
+			sessionAffinityFormat: undefined,
+			supportsCacheControlOnTools: caching,
 			supportsEagerToolInputStreaming: false,
 			supportsLongCacheRetention: false,
 			sendSessionAffinityHeaders: false,
@@ -1078,30 +1175,52 @@ function createAnthropicBindingClient(
 	options: SimpleStreamOptions | undefined,
 	binding: CloudflareBindingStreamConfig,
 ): AnthropicOptions['client'] {
+	// pi 0.87 calls `client.beta.messages.create` (0.83 used `messages.create`);
+	// both namespaces share one request path so the wire stays version-agnostic.
+	// The beta namespace translates `params.betas` into the `anthropic-beta`
+	// header like the Anthropic SDK (see prepareAnthropicBindingRequest).
+	type RequestOptions = { signal?: AbortSignal };
+	const send = (
+		namespace: 'messages' | 'beta',
+		params: Record<string, unknown>,
+		requestOptions: RequestOptions | undefined,
+	) => {
+		return {
+			async asResponse() {
+				const run = gatewayRunOptions(binding.gateway);
+				const { body, extraHeaders } = prepareAnthropicBindingRequest(namespace, params, {
+					...buildExtraHeaders(options),
+					...run.headers,
+				});
+				const response = (await (ai.run as unknown as RunOverload)(model.id, body, {
+					returnRawResponse: true,
+					...(requestOptions?.signal ? { signal: requestOptions.signal } : {}),
+					...(Object.keys(extraHeaders).length > 0 ? { extraHeaders } : {}),
+					...(run.gateway ? { gateway: run.gateway } : {}),
+				})) as Response;
+
+				await assertSuccessfulBindingResponse(response);
+				// pi-ai's Anthropic protocol consumes the body itself, so the
+				// idle deadline wraps the Response it hands back.
+				if (!response.body) return response;
+				return new Response(
+					withStreamIdleDeadline(response.body, binding.streamIdleTimeoutMs),
+					response,
+				);
+			},
+		};
+	};
 	return {
 		messages: {
-			create(params: Record<string, unknown>, requestOptions?: { signal?: AbortSignal }) {
-				return {
-					async asResponse() {
-						const run = gatewayRunOptions(binding.gateway);
-						const extraHeaders = { ...buildExtraHeaders(options), ...run.headers };
-						const response = (await (ai.run as unknown as RunOverload)(model.id, params, {
-							returnRawResponse: true,
-							...(requestOptions?.signal ? { signal: requestOptions.signal } : {}),
-							...(Object.keys(extraHeaders).length > 0 ? { extraHeaders } : {}),
-							...(run.gateway ? { gateway: run.gateway } : {}),
-						})) as Response;
-
-						await assertSuccessfulBindingResponse(response);
-						// pi-ai's Anthropic protocol consumes the body itself, so the
-						// idle deadline wraps the Response it hands back.
-						if (!response.body) return response;
-						return new Response(
-							withStreamIdleDeadline(response.body, binding.streamIdleTimeoutMs),
-							response,
-						);
-					},
-				};
+			create(params: Record<string, unknown>, requestOptions?: RequestOptions) {
+				return send('messages', params, requestOptions);
+			},
+		},
+		beta: {
+			messages: {
+				create(params: Record<string, unknown>, requestOptions?: RequestOptions) {
+					return send('beta', params, requestOptions);
+				},
 			},
 		},
 	} as unknown as AnthropicOptions['client'];
@@ -1152,6 +1271,19 @@ async function assertSuccessfulBindingResponse(response: Response): Promise<void
 		status: response.status,
 		statusText: response.statusText,
 		body,
+	});
+}
+
+function normalizeAssistantContent(value: unknown): string | undefined {
+	if (value === null || value === undefined) return undefined;
+	if (typeof value === 'string') return value;
+	const received = Array.isArray(value)
+		? 'an array'
+		: typeof value === 'object'
+			? 'an object'
+			: `a value of type ${typeof value}`;
+	throw new CloudflareAIBindingError({
+		message: `Cloudflare AI binding returned invalid choices[0].delta.content: expected a string, null, or an omitted field; received ${received}.`,
 	});
 }
 
@@ -1224,6 +1356,16 @@ export interface CloudflareAIBinding {
 	): Promise<Response | Record<string, unknown>>;
 }
 
+/**
+ * Anthropic prompt-cache retention for the binding's Anthropic path
+ * (`anthropic/…` gateway models). The Workers AI binding forwards
+ * `cache_control` on message blocks and tools to Anthropic, so opt-in caching
+ * serves repeated prefixes at the cached input rate instead of full price.
+ * `'long'` requests the 1-hour TTL where the platform supports it. Default
+ * `'none'` keeps the current behavior (no cache markers).
+ */
+export type CloudflareCacheRetention = 'none' | 'short' | 'long';
+
 export interface CloudflareBindingProviderOptions {
 	/** The captured `env.AI` reference. */
 	binding: CloudflareAIBinding;
@@ -1248,6 +1390,15 @@ export interface CloudflareBindingProviderOptions {
 	 * keepalives nor reasoning deltas stream. `0` disables the guard.
 	 */
 	streamIdleTimeoutMs?: number;
+	/**
+	 * Anthropic prompt-cache retention for `anthropic/…` models routed
+	 * through the binding. Default `'none'` matches the current behavior (no
+	 * `cache_control` markers); opt in with `'short'` (5-minute TTL) or
+	 * `'long'` (1-hour TTL where supported) to cache repeated prefixes and
+	 * pay the cached input rate on cache hits. Requires the agent to send a
+	 * stable `sessionId` so the binding can reuse the cache across turns.
+	 */
+	cacheRetention?: CloudflareCacheRetention;
 }
 
 /**
@@ -1271,10 +1422,14 @@ export function cloudflareBindingProvider(options: CloudflareBindingProviderOpti
 	const binding: CloudflareBindingStreamConfig = {
 		gateway,
 		streamIdleTimeoutMs: options.streamIdleTimeoutMs ?? DEFAULT_STREAM_IDLE_TIMEOUT_MS,
+		cacheRetention: options.cacheRetention ?? 'none',
 	};
 	const ai = options.binding as Ai;
-	const stream = (model: Model<Api>, context: Context, streamOptions?: SimpleStreamOptions) =>
-		streamCloudflareWorkersAi(ai, binding, model, context, streamOptions);
+	const stream = (
+		model: Model<Api>,
+		context: TranscriptContext,
+		streamOptions?: SimpleStreamOptions,
+	) => streamCloudflareWorkersAi(ai, binding, model, context, streamOptions);
 	const streams: ProviderStreams = { stream, streamSimple: stream };
 
 	const provider = createProvider<Api>({
@@ -1302,7 +1457,11 @@ function bindingCatalogModels(): Model<Api>[] {
 			api: CLOUDFLARE_AI_BINDING_API,
 			provider: 'cloudflare',
 			baseUrl: '',
-			compat: undefined,
+			// Keep the catalog's per-model compat overrides (e.g. DeepSeek's
+			// `requiresReasoningContentOnAssistantMessages`/`thinkingFormat`):
+			// the chat-completions branch merges them over the base profile.
+			// `as never` because the binding api is outside pi's compat map.
+			compat: model.compat as never,
 		}));
 }
 
@@ -1326,9 +1485,6 @@ function gatewayCatalogModels(): Model<Api>[] {
 					id: `${vendor}/${model.id}`,
 					provider: 'cloudflare',
 					baseUrl: '',
-					// The gateway branches own compat: `toAnthropicGatewayModel`
-					// replaces it, and the binding applies session affinity itself.
-					compat: undefined,
 				},
 			];
 		});

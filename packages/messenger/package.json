@@ -1,6 +1,6 @@
 {
 	"name": "@flue/messenger",
-	"version": "2.0.3",
+	"version": "2.3.0",
 	"type": "module",
 	"license": "Apache-2.0",
 	"homepage": "https://flueframework.com/",
@@ -30,7 +30,7 @@
 		"test:workerd": "vitest run --config vitest.workerd.config.ts"
 	},
 	"dependencies": {
-		"hono": "4.12.32"
+		"hono": "^4.12.32"
 	},
 	"peerDependencies": {
 		"@flue/runtime": "workspace:^"

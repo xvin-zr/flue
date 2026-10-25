@@ -32,7 +32,7 @@
 			]
 		},
 		"packages/runtime": {
-			"entry": ["test/fixtures/durable-boundary-child.mjs"],
+			"entry": ["test/fixtures/durable-boundary-child.mjs", "test/**/*.test-d.ts"],
 			"ignoreDependencies": ["@hono/node-server"]
 		},
 		"packages/vite": {

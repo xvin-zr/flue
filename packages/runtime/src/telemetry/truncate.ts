@@ -27,7 +27,7 @@ export function truncateContent(content: unknown, options: { maxBytes: number })
 	if (!Number.isSafeInteger(options.maxBytes) || options.maxBytes < MIN_BUDGET_BYTES) {
 		throw new TypeError(`maxBytes must be a safe integer of at least ${MIN_BUDGET_BYTES}.`);
 	}
-	return fit(content, options.maxBytes);
+	return fitWithin(content, options.maxBytes);
 }
 
 /** Serialized UTF-8 byte length, or undefined when JSON can't represent it. */
@@ -42,7 +42,7 @@ function measure(value: unknown): number | undefined {
 	return ENCODER.encode(serialized).byteLength;
 }
 
-function fit(value: unknown, budget: number): unknown {
+function fitWithin(value: unknown, budget: number): unknown {
 	const size = measure(value);
 	if (size === undefined) return CONTENT_UNSERIALIZABLE;
 	if (size <= budget) return value;
@@ -94,38 +94,135 @@ function safeSlice(value: string, end: number): string {
  */
 function truncateArray(value: unknown[], budget: number): unknown {
 	const messageShaped = isMessageArray(value);
+	const outputShaped = isOutputMessageArray(value);
 	const items = [...value];
 	let droppedCount = 0;
 	let droppedBytes = 0;
-	while (items.length > 1) {
-		const removed = items.shift();
-		droppedCount += 1;
-		droppedBytes += (measure(removed) ?? 0) + 1;
-		const candidate = [sentinelItem(messageShaped, droppedCount, droppedBytes), ...items];
-		const size = measure(candidate);
-		if (size !== undefined && size <= budget) return candidate;
+	const sizes = measurePlainArrayElements(items);
+	if (sizes) {
+		// A suffix sum lets us find the first fitting tail without serializing the
+		// entire remaining array after every dropped element.
+		const tailBytes = new Array<number>(items.length + 1).fill(0);
+		for (let index = items.length - 1; index >= 0; index -= 1) {
+			tailBytes[index] = tailBytes[index + 1]! + sizes[index]!;
+		}
+		while (droppedCount < items.length - 1) {
+			droppedBytes += sizes[droppedCount]! + 1;
+			droppedCount += 1;
+			const sentinel = sentinelItem(messageShaped, outputShaped, droppedCount, droppedBytes);
+			const tailLength = items.length - droppedCount;
+			// Two brackets, the sentinel, the tail, and one comma per tail item.
+			const size = 2 + (measure(sentinel) ?? 0) + tailBytes[droppedCount]! + tailLength;
+			if (size <= budget) {
+				const candidate = [sentinel, ...items.slice(droppedCount)];
+				// Keep actual serialization authoritative at the selected boundary.
+				const measured = measure(candidate);
+				if (measured !== undefined && measured <= budget) return candidate;
+			}
+		}
+		items.splice(0, droppedCount);
+	} else {
+		// Preserve the public helper's behavior for exotic values whose
+		// serialization can depend on array position or repeated evaluation.
+		while (items.length > 1) {
+			const removed = items.shift();
+			droppedCount += 1;
+			droppedBytes += (measure(removed) ?? 0) + 1;
+			const candidate = [
+				sentinelItem(messageShaped, outputShaped, droppedCount, droppedBytes),
+				...items,
+			];
+			const size = measure(candidate);
+			if (size !== undefined && size <= budget) return candidate;
+		}
 	}
 	const sentinel =
-		droppedCount > 0 ? sentinelItem(messageShaped, droppedCount, droppedBytes) : undefined;
+		droppedCount > 0
+			? sentinelItem(messageShaped, outputShaped, droppedCount, droppedBytes)
+			: undefined;
 	const overhead = (sentinel ? (measure(sentinel) ?? 0) + 1 : 0) + 4;
 	// Shrink the last element only when a workable slice of the budget is left
-	// beside the sentinel, and re-measure the result: nested fit() calls bottom
+	// beside the sentinel, and re-measure the result: nested fitWithin() calls bottom
 	// out in fixed-size markers that can overshoot a tight budget.
 	const innerBudget = budget - overhead;
 	if (innerBudget >= MIN_LEAF_BYTES) {
-		const shrunk = fit(items[0], innerBudget);
-		const candidate = sentinel ? [sentinel, shrunk] : [shrunk];
+		const shrunk = fitWithin(items[0], innerBudget);
+		// A single element that bottoms out lands a bare diagnostic string — for
+		// a message array that would violate the message-array schema, so wrap it
+		// in the shape-preserving envelope.
+		const element =
+			messageShaped && typeof shrunk === 'string'
+				? diagnosticMessage(shrunk, outputShaped)
+				: shrunk;
+		const candidate = sentinel ? [sentinel, element] : [element];
 		const size = measure(candidate);
 		if (size !== undefined && size <= budget) return candidate;
 	}
 	// Nothing fits beside the sentinel: count the last element as dropped too,
 	// and bail to the bare exceeded marker when even that sentinel is too big.
 	const allDropped = [
-		sentinelItem(messageShaped, droppedCount + 1, droppedBytes + (measure(items[0]) ?? 0) + 1),
+		sentinelItem(
+			messageShaped,
+			outputShaped,
+			droppedCount + 1,
+			droppedBytes + (measure(items[0]) ?? 0) + 1,
+		),
 	];
 	const allDroppedSize = measure(allDropped);
 	if (allDroppedSize !== undefined && allDroppedSize <= budget) return allDropped;
+	if (messageShaped) {
+		// Even the drop sentinel does not fit: emit the smallest shape-preserving
+		// message — the envelope around the bare exceeded marker — rather than a
+		// bare string that violates the message-array schema.
+		const floor = [diagnosticMessage(CONTENT_BUDGET_EXCEEDED, outputShaped)];
+		const floorSize = measure(floor);
+		if (floorSize !== undefined && floorSize <= budget) return floor;
+	}
 	return CONTENT_BUDGET_EXCEEDED;
+}
+
+/**
+ * Measure ordinary JSON data once per array element. Values with custom
+ * serialization, accessors, unsupported leaves, or cycles use the legacy
+ * path because repeated JSON.stringify calls can be observably different.
+ */
+function measurePlainArrayElements(items: unknown[]): number[] | undefined {
+	const sizes: number[] = [];
+	for (const item of items) {
+		if (!isPlainJsonValue(item, new Set())) return undefined;
+		const size = measure(item);
+		if (size === undefined) return undefined;
+		sizes.push(size);
+	}
+	return sizes;
+}
+
+function isPlainJsonValue(value: unknown, ancestors: Set<object>): boolean {
+	if (
+		value === null ||
+		typeof value === 'string' ||
+		typeof value === 'boolean' ||
+		(typeof value === 'number' && Number.isFinite(value))
+	) {
+		return true;
+	}
+	if (typeof value !== 'object') return false;
+	const prototype = Object.getPrototypeOf(value);
+	if (!Array.isArray(value) && prototype !== Object.prototype && prototype !== null) {
+		return false;
+	}
+	if (ancestors.has(value)) return false;
+	ancestors.add(value);
+	const descriptors = Object.getOwnPropertyDescriptors(value);
+	for (const [key, descriptor] of Object.entries(descriptors)) {
+		if (Array.isArray(value) && key === 'length') continue;
+		if (!('value' in descriptor) || !isPlainJsonValue(descriptor.value, ancestors)) {
+			ancestors.delete(value);
+			return false;
+		}
+	}
+	ancestors.delete(value);
+	return true;
 }
 
 function isMessageArray(value: unknown[]): boolean {
@@ -141,14 +238,46 @@ function isMessageArray(value: unknown[]): boolean {
 	);
 }
 
+/** An output-message array: message-shaped elements that also carry `finish_reason`. */
+function isOutputMessageArray(value: unknown[]): boolean {
+	return (
+		isMessageArray(value) &&
+		value.every((item) => typeof (item as { finish_reason?: unknown }).finish_reason === 'string')
+	);
+}
+
+/**
+ * Shape-preserving wrapper for a bare diagnostic that landed where a message
+ * belongs: `gen_ai.input.messages` / `gen_ai.output.messages` must stay an
+ * array of `{ role, parts }` messages (output messages also carry
+ * `finish_reason`), and a bare string would violate that contract.
+ */
+function diagnosticMessage(diagnostic: string, outputShaped: boolean): unknown {
+	return {
+		role: 'flue',
+		...(outputShaped ? { finish_reason: 'error' } : {}),
+		parts: [{ type: 'text', content: diagnostic }],
+	};
+}
+
 /**
  * `role: 'flue'` is deliberate: honest, filterable, and never confused with a
- * real conversation turn.
+ * real conversation turn. Output-message fallbacks keep the schema's required
+ * `finish_reason`.
  */
-function sentinelItem(messageShaped: boolean, count: number, bytes: number): unknown {
+function sentinelItem(
+	messageShaped: boolean,
+	outputShaped: boolean,
+	count: number,
+	bytes: number,
+): unknown {
 	const text = `[flue] ${count} ${messageShaped ? 'messages' : 'items'} omitted (${bytes} bytes) to fit the attribute budget`;
 	if (!messageShaped) return text;
-	return { role: 'flue', parts: [{ type: 'text', content: text }] };
+	return {
+		role: 'flue',
+		...(outputShaped ? { finish_reason: 'error' } : {}),
+		parts: [{ type: 'text', content: text }],
+	};
 }
 
 /**
