@@ -1,6 +1,6 @@
 {
 	"name": "flue-svelte",
-	"version": "2.3.0",
+	"version": "2.3.1",
 	"description": "Community-maintained, unofficial Svelte 5 adapter for Flue conversations",
 	"//": "Modified for community distribution: independent package identity and public SDK dependency; see NOTICE.",
 	"type": "module",
@@ -32,11 +32,11 @@
 		"test": "vitest run"
 	},
 	"peerDependencies": {
-		"@flue/sdk": "2.3.0",
+		"@flue/sdk": "2.3.1",
 		"svelte": "^5.3.0"
 	},
 	"devDependencies": {
-		"@flue/sdk": "2.3.0",
+		"@flue/sdk": "2.3.1",
 		"@sveltejs/vite-plugin-svelte": "^7.3.0",
 		"happy-dom": "^20.11.0",
 		"svelte": "^5.56.8",
