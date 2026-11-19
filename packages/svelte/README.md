@@ -5,10 +5,10 @@ Community-maintained, **unofficial** Svelte adapter for Flue; not published or s
 Svelte 5 reactive state for live Flue agent conversations. `flue-svelte` manages UI state; `@flue/sdk` handles HTTP and Durable Streams transport.
 
 ```sh
-pnpm add flue-svelte @flue/sdk@2.3.0
+pnpm add flue-svelte @flue/sdk@2.3.1
 ```
 
-Requires Svelte `^5.3.0` and exactly `@flue/sdk@2.3.0`.
+Requires Svelte `^5.3.0` and exactly `@flue/sdk@2.3.1`.
 
 ## `useFlueAgent()`
 

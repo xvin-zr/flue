@@ -1811,8 +1811,8 @@ importers:
   packages/svelte:
     devDependencies:
       '@flue/sdk':
-        specifier: 2.3.0
-        version: 2.3.0
+        specifier: 2.3.1
+        version: 2.3.1
       '@sveltejs/vite-plugin-svelte':
         specifier: ^7.3.0
         version: 7.3.1(svelte@5.57.3)(vite@8.3.8(@types/node@26.6.6)(esbuild@0.28.1)(jiti@2.7.0)(tsx@4.23.1)(yaml@2.9.0))
@@ -3027,8 +3027,8 @@ packages:
   '@floating-ui/utils@0.2.12':
     resolution: {integrity: sha512-HpCo8tmWzLVad5s2d19EhAz5zqrrQ6s69qd6moPMQvkOuSwDT1YgRfWSVuc4ennqrgv3OHppiOGMQ7oC13yIww==}
 
-  '@flue/sdk@2.3.0':
-    resolution: {integrity: sha512-6rVUYjGu0ICogo/j5z8edsc8H7ZUJ7EEmEcJl/dVwhE6Ugjlwea+nToOjDHOm6fsWsvltOcd5wi3YUwKY6haVw==}
+  '@flue/sdk@2.3.1':
+    resolution: {integrity: sha512-kT4FNB6lzeu4ZKnn0PDbTy8Rk9ymnQTbN19+KnTXjGRqhAHkoS0EvOrUJAGRvQzb5N15hVQRT/yr7loVr0kdVA==}
 
   '@google/genai@1.52.0':
     resolution: {integrity: sha512-gwSvbpiN/17O9TbsqSsE/OzZcpv5Fo4RQjdngGgogtuB9RsyJ8ZHhX5KjHj1bp5N9snN2eK8LDGXSaWW2hof8Q==}
@@ -11498,7 +11498,7 @@ snapshots:
 
   '@floating-ui/utils@0.2.12': {}
 
-  '@flue/sdk@2.3.0':
+  '@flue/sdk@2.3.1':
     dependencies:
       '@durable-streams/client': 0.2.6
 
